@@ -1,0 +1,109 @@
+# phx_auth
+
+## Connect to the node
+
+Start the server with `iex --sname phx_auth --cookie phx_auth -S mix phx.server` and the connect using the `Runtime Settings` button on the left.
+
+You will see the livebook node connected in the `phx_auth` node with `:erlang.nodes([:hidden])`.
+
+<!-- livebook:{"break_markdown":true} -->
+
+The `mix phx.gen.auth --live Accounts User users` will scaffold the LiveView-based authentication code for us. After `mix do deps.get, ecto.migrate` and restarting the server we shuld be able to to navigate to the registartion form at http://localhost:4000/users/register.
+
+In essence the generator created a banch of LiveViews:
+
+```elixir
+# include the user_auth in the web scope
+File.ls!("lib/phx_auth_web/live")
+```
+
+and the supporting context:
+
+```elixir
+# include the accounts.ex
+Path.wildcard("lib/phx_auth/accounts/*")
+```
+
+And the `lib/phx_auth_web/controllers/user_session_controller.ex`
+
+<!-- livebook:{"break_markdown":true} -->
+
+There are a few other notable changes in:
+
+* `lib/phx_auth_web/components/layouts/root.html.heex` - links for a logged in user (e.g: LogOut button)
+* ` lib/phx_auth_web/router.ex` - so called "Authentication routes" for users and session management; more or that later.
+
+<!-- livebook:{"break_markdown":true} -->
+
+The migration created the following tables and indices:
+
+```log
+20:38:28.373 [info] create table users
+20:38:28.389 [info] create index users_email_index
+20:38:28.393 [info] create table users_tokens
+20:38:28.411 [info] create index users_tokens_user_id_index
+20:38:28.413 [info] create index users_tokens_context_token_index
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+With the seutp in place we can start exploring how particular users flows work.
+
+## User Registration
+
+Go to http://localhost:4000/users/register and start typing in either email or password. You will see debug logs about on the `validate` events:
+
+```
+[debug] HANDLE EVENT "validate" in PhxAuthWeb.UserRegistrationLive
+  Parameters: %{"_csrf_token" => "BSYWB05iB1Z7Ng5hOhgfMw5bGT86XX8yVHrjyTCgO_eSQSmTHnFEOl6c", "_target" => ["user", "email"], "user" => %{"email" => "mentel.szymon@gmail.com", "password" => "[FILTERED]"}}
+[debug] Replied in 285µs
+```
+
+They are handled in the `PhxAuthWeb.UserRegistrationLive.handle_event("validate", %{"user" => params}, socket)`. The function tries to build a `%User{}` changeset - if it happens to be invalid (e.g: the email is missing the `@` character) and error will be displayed (this is done in the `input` funciton componenet defined in the `PhxAuthWeb.CoreComponents`).
+
+Before we devine into the accounts creation, let's take a step back and understand how we got here. If you look at the `router.ex`, the `/user/register` router lives within the scope that pipes a request through the `redirect_if_user_is_authenticated` plug and then calls the `on_mount(:redirect_if_user_is_athenticated)` because of the `on_mount` seeting for the `live_session :redirect_if_user_is_authenticated` (both imported from the `PhxAuthWeb.UserAuth`). This is for security reasons so that we redirect from a LiveNavigation (e.g: throuh a live naviagtion; more here <TODO>).
+
+You can verify it's true by traccing that little function with and then accessing the page:
+
+```elixir
+Extrace.calls({PhxAuthWeb.UserAuth, :_, :_}, 100, args: :arity)
+```
+
+That revales one more things: the `fetch_current_user/2` which is plugged in at the top of the router and the 2nd call to the `on_mount/4` - this is how because how LiveView works - the 1st call is for a disconnected state while the 2nd one is for the connected state (see TOOD for details).
+
+<!-- livebook:{"break_markdown":true} -->
+
+Clicking the `Create an account` triggers the `save` event handled by the correspodning `handle_event`. That casues a lot of things across the `UserRegistrationLive`, `SessionController`, `UserAuth` and the `Accounts` context. Let's setup some tracing to see what functions are called:
+
+```elixir
+Extrace.calls(
+  [
+    {PhxAuthWeb.UserAuth, :_, :_},
+    {PhxAuthWeb.UserSessionController, :_, :_},
+    {PhxAuth.Accounts, :_, :_}
+  ],
+  100,
+  args: :arity
+)
+```
+
+You might got overwhelmed by seeing that bunch of things have happend on registration. Worry not, we're to break it down step by step.
+
+First of all, when the form with the email/password is submited the `save` event with user params is handled within the corresponding `handle_event` and the user is saved to the DB with the `Accounts.register_user/1` as well as it confirmation instrucitons are delivered (see the email at `http://localhost:4000/dev/mailbox`). What happens next is that we set the `phx-trigger-action` attribute to `true` which makes the form being POSTed to `~p"/users/log_in?_action=registered"` and handled in `UserSessionController`.
+
+Before moving on the session, let's find a long confirming we've stored the user in the DB
+
+```log
+[debug] QUERY OK source="users" db=17.9ms queue=5.9ms idle=657.7ms
+INSERT INTO "users" ("email","hashed_password","inserted_at","updated_at") VALUES ($1,$2,$3,$4) RETURNING "id" ["mentel.szymon@gmail.com", "$2b$12$fRW7gl7LkE4BwVgF4VQ.MuTAPspwUgZHK3V3RpPPLQqsLvIJGhaFK", ~U[2024-03-14 13:10:36Z], ~U[2024-03-14 13:10:36Z]]
+```
+
+In the session controller we match the `create(conn, %{"_action" => "registered"} = params)` function head which takes us to "generic" function clause which fetches the user by the provided e-mail address and password from the `Accounts` context. On success the user is logged in with `UserAuth.log_in_user/1` and redirected to the paged it came from or to `UserAuth.signed_in_path/1`.
+
+I'll close this seciton here since the login flow is discussed in the next. One last thing to note is that the user is logged in instantly after successful registartion without refreshing the page.
+
+All of that to make the registered user don't have to realoed to get the token in the cookie.
+
+## References
+
+* https://fly.io/phoenix-files/phx-trigger-action/
